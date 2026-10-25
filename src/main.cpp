@@ -45,6 +45,10 @@ volatile bool     headLedEnabled = false;
 volatile bool     camPowerEnabled = true;
 volatile bool     buzzerEnabled = true; // Toggled via AUX_VOLUME (target=6)
 volatile uint8_t  buzzerVolume = 50;
+volatile uint8_t  lastAcceptedTarget = 0;
+volatile uint8_t  lastAcceptedState = 0;
+volatile uint8_t  lastAcceptedValue = 0;
+volatile uint32_t lastAcceptedSeq = 0;
 
 volatile float    servoPanTarget = SERVO_CENTER_DEG;
 volatile float    servoTiltTarget = SERVO_CENTER_DEG;
@@ -74,6 +78,7 @@ float    gyroZBias = 0.0f;
 
 // Broadcast address to send SensorPacket back to DOOM Hand
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint32_t lastHeadStatusMs = 0;
 
 // =====================================================
 // SERVO PWM DRIVER (ESP32 Arduino Core 3.x LEDC API)
@@ -254,7 +259,72 @@ void sendSensorTelemetry(float distanceCm, bool valid) {
   }
 }
 
-void handleAuxTarget(uint8_t target, uint8_t state, uint8_t value) {
+void sendAuxAck(uint8_t target, uint8_t state, uint8_t value, uint32_t sequence) {
+  AuxAckPacket ack;
+  ack.magic = DOOM_MAGIC;
+  ack.type = 6;
+  ack.target = target;
+  ack.state = state;
+  ack.value = value;
+  ack.sequence = sequence;
+  esp_now_send(broadcastAddress, (uint8_t *)&ack, sizeof(ack));
+}
+
+void sendHeadStatus() {
+  HeadStatusPacket status = {};
+  status.magic = DOOM_MAGIC;
+  status.type = 5;
+  status.version = 1;
+
+  portENTER_CRITICAL(&rxMux);
+  status.laser = laserEnabled ? 1 : 0;
+  status.headLed = headLedEnabled ? 1 : 0;
+  status.camPower = camPowerEnabled ? 1 : 0;
+  status.buzzer = buzzerEnabled ? 1 : 0;
+  status.buzzerVolume = buzzerVolume;
+  status.joyMode = joyMode;
+  status.joyX = joyX;
+  status.joyY = joyY;
+  status.lastTarget = lastAcceptedTarget;
+  status.lastState = lastAcceptedState;
+  status.lastValue = lastAcceptedValue;
+  status.lastSeq = lastAcceptedSeq;
+  status.panTarget = servoPanTarget;
+  status.tiltTarget = servoTiltTarget;
+  status.distanceCm = lastDistanceCm;
+  status.distanceValid = lastDistanceValid ? 1 : 0;
+  status.echoUs = 0;
+  status.controlAgeMs = (lastControlMs == 0) ? 0xFFFFFFFFu : (millis() - lastControlMs);
+  status.rxPacketCount = rxPacketCount;
+  status.rxControlCount = rxControlCount;
+  status.rxAuxCount = rxAuxCount;
+  status.rxLegacyCount = rxLegacyCount;
+  status.rxRejectedCount = rxRejectedCount;
+  status.telemetryTxFailureCount = telemetryTxFailureCount;
+  status.radioChannel = WIFI_CHANNEL;
+  status.reserved = 0;
+  portEXIT_CRITICAL(&rxMux);
+
+  esp_now_send(broadcastAddress, (uint8_t *)&status, sizeof(status));
+}
+
+int8_t normalizeJoystickAdc(uint16_t reading, uint16_t center,
+                            uint16_t negativeThreshold, uint16_t positiveThreshold) {
+  int32_t normalized;
+  if (reading < center) {
+    normalized = ((int32_t)reading - center) * 100 /
+                 ((int32_t)center - negativeThreshold);
+  } else {
+    normalized = ((int32_t)reading - center) * 100 /
+                 ((int32_t)positiveThreshold - center);
+  }
+
+  if (normalized < -100) normalized = -100;
+  if (normalized > 100) normalized = 100;
+  return (int8_t)normalized;
+}
+
+void handleAuxTarget(uint8_t target, uint8_t state, uint8_t value, uint32_t sequence) {
   portENTER_CRITICAL_ISR(&rxMux);
   switch (target) {
     case AUX_CAMERA_POWER:
@@ -280,6 +350,11 @@ void handleAuxTarget(uint8_t target, uint8_t state, uint8_t value) {
     default:
       break;
   }
+
+  lastAcceptedTarget = target;
+  lastAcceptedState = state;
+  lastAcceptedValue = value;
+  lastAcceptedSeq = sequence;
   portEXIT_CRITICAL_ISR(&rxMux);
 }
 
@@ -295,18 +370,59 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     return;
   }
 
-  // 1. Check for V3ControlPacket (type = 3, magic = 0xB808)
-  if (len == sizeof(V3ControlPacket)) {
-    V3ControlPacket ctrl;
-    memcpy(&ctrl, data, sizeof(ctrl));
-    if (ctrl.magic == DOOM_MAGIC && ctrl.type == 3) {
+  if (len <= 32) {
+    Serial.printf("RX len=%d hdr=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                  len,
+                  data[0], data[1], data[2], data[3],
+                  data[4], data[5], data[6], data[7]);
+  }
+
+  // Accept raw-ADC packets and the earlier normalized -100..100 packet layout.
+  bool rawAdcPacket = len == sizeof(V3ControlPacket) || len == sizeof(V3ControlPacket) - 1;
+  bool normalizedPacket = len == 11 || len == 10;
+  if (rawAdcPacket || normalizedPacket) {
+    uint16_t magic = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+    uint8_t type = data[2];
+    uint8_t mode = data[3];
+    int8_t x;
+    int8_t y;
+    uint8_t zoom;
+    uint32_t sequence;
+
+    if (rawAdcPacket) {
+      uint16_t rawX = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
+      uint16_t rawY = (uint16_t)data[6] | ((uint16_t)data[7] << 8);
+      x = normalizeJoystickAdc(rawX, X_CENTER, X_LEFT_THRESHOLD, X_RIGHT_THRESHOLD);
+      y = normalizeJoystickAdc(rawY, Y_CENTER, Y_BACK_THRESHOLD, Y_FRONT_THRESHOLD);
+      zoom = (len == sizeof(V3ControlPacket)) ? data[8] : 0;
+      uint8_t sequenceOffset = (len == sizeof(V3ControlPacket)) ? 9 : 8;
+      sequence = (uint32_t)data[sequenceOffset] |
+                 ((uint32_t)data[sequenceOffset + 1] << 8) |
+                 ((uint32_t)data[sequenceOffset + 2] << 16) |
+                 ((uint32_t)data[sequenceOffset + 3] << 24);
+    } else {
+      x = (int8_t)data[4];
+      y = (int8_t)data[5];
+      zoom = (len == 11) ? data[6] : 0;
+      uint8_t sequenceOffset = (len == 11) ? 7 : 6;
+      sequence = (uint32_t)data[sequenceOffset] |
+                 ((uint32_t)data[sequenceOffset + 1] << 8) |
+                 ((uint32_t)data[sequenceOffset + 2] << 16) |
+                 ((uint32_t)data[sequenceOffset + 3] << 24);
+    }
+
+    if (magic == DOOM_MAGIC && type == 3) {
       portENTER_CRITICAL_ISR(&rxMux);
-      joyMode       = ctrl.mode;
-      joyX          = ctrl.x;
-      joyY          = ctrl.y;
+      joyMode       = mode;
+      joyX          = x;
+      joyY          = y;
       lastControlMs = millis();
       rxControlCount++;
       portEXIT_CRITICAL_ISR(&rxMux);
+
+      Serial.printf("CTRL ACCEPT mode=%u x=%d y=%d zoom=%u seq=%lu\n",
+                    (unsigned)mode, (int)x, (int)y,
+                    (unsigned)zoom, (unsigned long)sequence);
       return;
     }
   }
@@ -316,7 +432,8 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     V3AuxCommand aux;
     memcpy(&aux, data, sizeof(aux));
     if (aux.magic == DOOM_MAGIC && aux.type == 4) {
-      handleAuxTarget(aux.target, aux.state, aux.value);
+      handleAuxTarget(aux.target, aux.state, aux.value, aux.sequence);
+      sendAuxAck(aux.target, aux.state, aux.value, aux.sequence);
       portENTER_CRITICAL_ISR(&rxMux);
       rxAuxCount++;
       portEXIT_CRITICAL_ISR(&rxMux);
@@ -329,7 +446,9 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     LegacyV3AuxCommand auxLegacy;
     memcpy(&auxLegacy, data, sizeof(auxLegacy));
     if (auxLegacy.magic == DOOM_MAGIC && auxLegacy.type == 4) {
-      handleAuxTarget(auxLegacy.target, auxLegacy.state, auxLegacy.state ? 50 : 0);
+      uint8_t legacyValue = (auxLegacy.state != 0) ? 50 : 0;
+      handleAuxTarget(auxLegacy.target, auxLegacy.state, legacyValue, auxLegacy.sequence);
+      sendAuxAck(auxLegacy.target, auxLegacy.state, legacyValue, auxLegacy.sequence);
       portENTER_CRITICAL_ISR(&rxMux);
       rxLegacyCount++;
       portEXIT_CRITICAL_ISR(&rxMux);
@@ -395,6 +514,7 @@ void setup() {
 
   Serial.print("HEAD ESP32 (A) MAC: ");
   Serial.println(WiFi.macAddress());
+  lastLaserCmdMs = millis();
 
   esp_err_t nowResult = esp_now_init();
   if (nowResult == ESP_OK) {
@@ -431,7 +551,9 @@ void loop() {
   }
 
   // 1. Laser heartbeat failsafe: turn off laser if no refresh within 1500 ms
-  //    (when controlled by continuous heartbeat)
+  if (laserEnabled && (now - lastLaserCmdMs) > LASER_FAILSAFE_MS) {
+    laserEnabled = false;
+  }
   applyHardwareOutputs();
 
   // 2. Update Servo Pan/Tilt at 50 Hz (every 20 ms)
@@ -452,6 +574,10 @@ void loop() {
     tiltTgt = servoTiltTarget;
     portEXIT_CRITICAL(&rxMux);
 
+    // Ignore small stick offsets and do not accumulate a target when the stick is centered.
+    if (abs(x) < JOYSTICK_DEADZONE) x = 0;
+    if (abs(y) < JOYSTICK_DEADZONE) y = 0;
+
     // If joystick is in HEAD mode (mode == 0) and link is active, nudge target angles
     if (mode == 0 && ctrlAge < CONTROL_TIMEOUT_MS && (x != 0 || y != 0)) {
       panTgt  += ((float)x / 100.0f) * JOY_SERVO_MAX_STEP_DEG;
@@ -463,6 +589,12 @@ void loop() {
       servoPanTarget  = panTgt;
       servoTiltTarget = tiltTgt;
       portEXIT_CRITICAL(&rxMux);
+
+      Serial.printf("SERVO update mode=%u age=%lu x=%d y=%d pan=%.1f tilt=%.1f\n",
+                    (unsigned)mode, (unsigned long)ctrlAge, x, y, panTgt, tiltTgt);
+    } else if (x == 0 && y == 0) {
+      Serial.printf("CTRL idle mode=%u age=%lu x=%d y=%d\n",
+                    (unsigned)mode, (unsigned long)ctrlAge, x, y);
     }
 
     // Smoothly interpolate toward target angles
@@ -488,4 +620,10 @@ void loop() {
   // 5. Trigger Head Buzzer Alarm if valid obstacle is closer than 10 cm
   bool obstacleClose = (lastDistanceValid && lastDistanceCm > 0.0f && lastDistanceCm < OBSTACLE_ALARM_CM);
   updateHeadBuzzer(obstacleClose);
+
+  // 6. Publish periodic HEAD status packet for controller health monitoring
+  if (now - lastHeadStatusMs >= 1000) {
+    lastHeadStatusMs = now;
+    sendHeadStatus();
+  }
 }

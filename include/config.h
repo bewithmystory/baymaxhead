@@ -23,6 +23,16 @@
 
 // Maximum servo speed in degrees per 20ms step when driven by joystick
 #define JOY_SERVO_MAX_STEP_DEG    2.5f
+#define JOYSTICK_DEADZONE        8
+
+// Hand-controller joystick ADC calibration (12-bit raw readings).
+// Threshold readings map to full directional input; center readings map to zero.
+#define X_CENTER                 2800
+#define Y_CENTER                 2780
+#define X_LEFT_THRESHOLD         2000
+#define X_RIGHT_THRESHOLD        3500
+#define Y_BACK_THRESHOLD         2000
+#define Y_FRONT_THRESHOLD        3500
 
 // Ultrasonic Telemetry & Obstacle Alarm Thresholds
 #define TELEMETRY_INTERVAL_MS     100   // 10 Hz SensorPacket broadcast to HAND
