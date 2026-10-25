@@ -28,14 +28,13 @@ typedef struct {
   uint16_t magic;     // 0xB808 verification
 } LaserCommand;
 
-// Joystick & Mode Control Packet (sent every 50 ms).
-// The current format transmits raw 12-bit ADC readings for both axes.
+// V3/V4 Joystick & Mode Control Packet (sent every 50 ms)
 typedef struct __attribute__((packed)) {
   uint16_t magic;     // 0xB808
   uint8_t type;       // 3 = joystick/zoom control
   uint8_t mode;       // 0 = HEAD servos, 1 = BODY motors
-  uint16_t x;         // Raw X-axis ADC reading (0..4095)
-  uint16_t y;         // Raw Y-axis ADC reading (0..4095)
+  int8_t x;           // Calibrated HAND control value (-100..100)
+  int8_t y;           // Calibrated HAND control value (-100..100)
   uint8_t zoom;       // 0..100 from potentiometer
   uint32_t sequence;
 } V3ControlPacket;

@@ -38,6 +38,7 @@ volatile int8_t   joyX = 0;
 volatile int8_t   joyY = 0;
 volatile uint8_t  joyMode = 0; // 0 = HEAD, 1 = BODY
 volatile uint32_t lastControlMs = 0;
+volatile uint32_t lastControlSequence = 0;
 
 volatile bool     laserEnabled = false;
 volatile uint32_t lastLaserCmdMs = 0;
@@ -62,6 +63,11 @@ uint32_t lastTelemetryMs = 0;
 uint32_t lastServoStepMs = 0;
 uint32_t lastMpuStepMs = 0;
 uint32_t lastDiagnosticsMs = 0;
+uint32_t lastControlLogMs = 0;
+int8_t lastLoggedJoyX = 0;
+int8_t lastLoggedJoyY = 0;
+uint8_t lastLoggedJoyMode = 0;
+bool controlLogInitialized = false;
 float    lastDistanceCm = -1.0f;
 bool     lastDistanceValid = false;
 
@@ -308,22 +314,6 @@ void sendHeadStatus() {
   esp_now_send(broadcastAddress, (uint8_t *)&status, sizeof(status));
 }
 
-int8_t normalizeJoystickAdc(uint16_t reading, uint16_t center,
-                            uint16_t negativeThreshold, uint16_t positiveThreshold) {
-  int32_t normalized;
-  if (reading < center) {
-    normalized = ((int32_t)reading - center) * 100 /
-                 ((int32_t)center - negativeThreshold);
-  } else {
-    normalized = ((int32_t)reading - center) * 100 /
-                 ((int32_t)positiveThreshold - center);
-  }
-
-  if (normalized < -100) normalized = -100;
-  if (normalized > 100) normalized = 100;
-  return (int8_t)normalized;
-}
-
 void handleAuxTarget(uint8_t target, uint8_t state, uint8_t value, uint32_t sequence) {
   portENTER_CRITICAL_ISR(&rxMux);
   switch (target) {
@@ -370,59 +360,19 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     return;
   }
 
-  if (len <= 32) {
-    Serial.printf("RX len=%d hdr=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                  len,
-                  data[0], data[1], data[2], data[3],
-                  data[4], data[5], data[6], data[7]);
-  }
-
-  // Accept raw-ADC packets and the earlier normalized -100..100 packet layout.
-  bool rawAdcPacket = len == sizeof(V3ControlPacket) || len == sizeof(V3ControlPacket) - 1;
-  bool normalizedPacket = len == 11 || len == 10;
-  if (rawAdcPacket || normalizedPacket) {
-    uint16_t magic = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-    uint8_t type = data[2];
-    uint8_t mode = data[3];
-    int8_t x;
-    int8_t y;
-    uint8_t zoom;
-    uint32_t sequence;
-
-    if (rawAdcPacket) {
-      uint16_t rawX = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
-      uint16_t rawY = (uint16_t)data[6] | ((uint16_t)data[7] << 8);
-      x = normalizeJoystickAdc(rawX, X_CENTER, X_LEFT_THRESHOLD, X_RIGHT_THRESHOLD);
-      y = normalizeJoystickAdc(rawY, Y_CENTER, Y_BACK_THRESHOLD, Y_FRONT_THRESHOLD);
-      zoom = (len == sizeof(V3ControlPacket)) ? data[8] : 0;
-      uint8_t sequenceOffset = (len == sizeof(V3ControlPacket)) ? 9 : 8;
-      sequence = (uint32_t)data[sequenceOffset] |
-                 ((uint32_t)data[sequenceOffset + 1] << 8) |
-                 ((uint32_t)data[sequenceOffset + 2] << 16) |
-                 ((uint32_t)data[sequenceOffset + 3] << 24);
-    } else {
-      x = (int8_t)data[4];
-      y = (int8_t)data[5];
-      zoom = (len == 11) ? data[6] : 0;
-      uint8_t sequenceOffset = (len == 11) ? 7 : 6;
-      sequence = (uint32_t)data[sequenceOffset] |
-                 ((uint32_t)data[sequenceOffset + 1] << 8) |
-                 ((uint32_t)data[sequenceOffset + 2] << 16) |
-                 ((uint32_t)data[sequenceOffset + 3] << 24);
-    }
-
-    if (magic == DOOM_MAGIC && type == 3) {
+  // 1. Check for the packed V3ControlPacket (type = 3, magic = 0xB808).
+  if (len == sizeof(V3ControlPacket)) {
+    V3ControlPacket ctrl;
+    memcpy(&ctrl, data, sizeof(ctrl));
+    if (ctrl.magic == DOOM_MAGIC && ctrl.type == 3) {
       portENTER_CRITICAL_ISR(&rxMux);
-      joyMode       = mode;
-      joyX          = x;
-      joyY          = y;
+      joyMode       = ctrl.mode;
+      joyX          = ctrl.x;
+      joyY          = ctrl.y;
       lastControlMs = millis();
+      lastControlSequence = ctrl.sequence;
       rxControlCount++;
       portEXIT_CRITICAL_ISR(&rxMux);
-
-      Serial.printf("CTRL ACCEPT mode=%u x=%d y=%d zoom=%u seq=%lu\n",
-                    (unsigned)mode, (int)x, (int)y,
-                    (unsigned)zoom, (unsigned long)sequence);
       return;
     }
   }
@@ -550,6 +500,34 @@ void loop() {
                   (unsigned long)txFailures);
   }
 
+  uint8_t controlMode;
+  int8_t controlX, controlY;
+  uint32_t controlSequence, controlAge;
+  bool hasControl;
+  portENTER_CRITICAL(&rxMux);
+  controlMode = joyMode;
+  controlX = joyX;
+  controlY = joyY;
+  controlSequence = lastControlSequence;
+  hasControl = lastControlMs != 0;
+  controlAge = hasControl ? (now - lastControlMs) : 0xFFFFFFFFu;
+  portEXIT_CRITICAL(&rxMux);
+
+  bool controlChanged = !controlLogInitialized ||
+                        controlMode != lastLoggedJoyMode ||
+                        controlX != lastLoggedJoyX ||
+                        controlY != lastLoggedJoyY;
+  if (hasControl && controlChanged && now - lastControlLogMs >= 100) {
+    lastControlLogMs = now;
+    lastLoggedJoyMode = controlMode;
+    lastLoggedJoyX = controlX;
+    lastLoggedJoyY = controlY;
+    controlLogInitialized = true;
+    Serial.printf("HEAD CONTROL RX mode=%u x=%d y=%d seq=%lu age=%lu\n",
+                  (unsigned)controlMode, (int)controlX, (int)controlY,
+                  (unsigned long)controlSequence, (unsigned long)controlAge);
+  }
+
   // 1. Laser heartbeat failsafe: turn off laser if no refresh within 1500 ms
   if (laserEnabled && (now - lastLaserCmdMs) > LASER_FAILSAFE_MS) {
     laserEnabled = false;
@@ -574,10 +552,6 @@ void loop() {
     tiltTgt = servoTiltTarget;
     portEXIT_CRITICAL(&rxMux);
 
-    // Ignore small stick offsets and do not accumulate a target when the stick is centered.
-    if (abs(x) < JOYSTICK_DEADZONE) x = 0;
-    if (abs(y) < JOYSTICK_DEADZONE) y = 0;
-
     // If joystick is in HEAD mode (mode == 0) and link is active, nudge target angles
     if (mode == 0 && ctrlAge < CONTROL_TIMEOUT_MS && (x != 0 || y != 0)) {
       panTgt  += ((float)x / 100.0f) * JOY_SERVO_MAX_STEP_DEG;
@@ -590,11 +564,6 @@ void loop() {
       servoTiltTarget = tiltTgt;
       portEXIT_CRITICAL(&rxMux);
 
-      Serial.printf("SERVO update mode=%u age=%lu x=%d y=%d pan=%.1f tilt=%.1f\n",
-                    (unsigned)mode, (unsigned long)ctrlAge, x, y, panTgt, tiltTgt);
-    } else if (x == 0 && y == 0) {
-      Serial.printf("CTRL idle mode=%u age=%lu x=%d y=%d\n",
-                    (unsigned)mode, (unsigned long)ctrlAge, x, y);
     }
 
     // Smoothly interpolate toward target angles

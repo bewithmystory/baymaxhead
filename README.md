@@ -36,7 +36,7 @@ This pin configuration is the fixed baseline for the current build.
 
 - [platformio.ini](platformio.ini) — PlatformIO build configuration.
 - [include/pins.h](include/pins.h) — fixed GPIO map for the head hardware.
-- [include/config.h](include/config.h) — servo limits, joystick ADC calibration, thresholds, and safety settings.
+- [include/config.h](include/config.h) — servo limits, motion rate, and safety settings.
 - [shared/protocol.h](shared/protocol.h) — shared command and telemetry packet definitions.
 - [src/main.cpp](src/main.cpp) — the main ESP32 firmware.
 - [headhelp.md](headhelp.md) — head-specific help and debugging notes.
@@ -49,6 +49,7 @@ This pin configuration is the fixed baseline for the current build.
 - Kept legacy auxiliary command support so the head still accepts older controller data.
 - Added controller-level AUX ACK responses and periodic HEAD status packets for health monitoring.
 - Added servo angle clamping and smoothing.
+- Kept joystick ADC calibration on the HAND; the HEAD receives normalized signed axis values.
 - Added laser failsafe so the laser turns off if commands stop.
 - Added obstacle warning buzzer based on ultrasonic data.
 - Added telemetry reporting and diagnostic serial logging.
