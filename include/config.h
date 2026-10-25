@@ -28,6 +28,7 @@
 #define TELEMETRY_INTERVAL_MS     100   // 10 Hz SensorPacket broadcast to HAND
 #define OBSTACLE_ALARM_CM         10.0f // Beep alarm when valid distance < 10 cm
 #define ULTRA_TIMEOUT_US          25000 // ~400 cm max echo wait
+#define OUTPUT_CONFIRM_BEEP_MS    120   // Confirmation beep for HEAD LED/laser state changes
 
 // Failsafe Timeouts
 #define CONTROL_TIMEOUT_MS        600   // Stop joystick servo motion if link drops

@@ -46,6 +46,7 @@ volatile bool     headLedEnabled = false;
 volatile bool     camPowerEnabled = true;
 volatile bool     buzzerEnabled = true; // Toggled via AUX_VOLUME (target=6)
 volatile uint8_t  buzzerVolume = 50;
+volatile uint32_t confirmationBeepUntilMs = 0;
 volatile uint8_t  lastAcceptedTarget = 0;
 volatile uint8_t  lastAcceptedState = 0;
 volatile uint8_t  lastAcceptedValue = 0;
@@ -130,8 +131,10 @@ void updateHeadBuzzer(bool obstacleNear) {
   static bool beepPhase = false;
 
   bool volOn;
+  uint32_t beepUntilMs;
   portENTER_CRITICAL(&rxMux);
   volOn = buzzerEnabled;
+  beepUntilMs = confirmationBeepUntilMs;
   portEXIT_CRITICAL(&rxMux);
 
   if (!volOn) {
@@ -146,6 +149,8 @@ void updateHeadBuzzer(bool obstacleNear) {
       beepPhase = !beepPhase;
       digitalWrite(HEAD_BUZZER_PIN, beepPhase ? HIGH : LOW);
     }
+  } else if ((int32_t)(beepUntilMs - millis()) > 0) {
+    digitalWrite(HEAD_BUZZER_PIN, HIGH);
   } else {
     digitalWrite(HEAD_BUZZER_PIN, LOW);
   }
@@ -315,15 +320,18 @@ void sendHeadStatus() {
 }
 
 void handleAuxTarget(uint8_t target, uint8_t state, uint8_t value, uint32_t sequence) {
+  bool outputStateChanged = false;
   portENTER_CRITICAL_ISR(&rxMux);
   switch (target) {
     case AUX_CAMERA_POWER:
       camPowerEnabled = (state != 0);
       break;
     case AUX_HEAD_LED:
+      outputStateChanged = headLedEnabled != (state != 0);
       headLedEnabled = (state != 0);
       break;
     case AUX_LASER:
+      outputStateChanged = laserEnabled != (state != 0);
       laserEnabled = (state != 0);
       lastLaserCmdMs = millis();
       break;
@@ -336,9 +344,14 @@ void handleAuxTarget(uint8_t target, uint8_t state, uint8_t value, uint32_t sequ
     case AUX_VOLUME:
       buzzerEnabled = (state != 0 && value > 0);
       buzzerVolume  = value;
+      if (!buzzerEnabled) confirmationBeepUntilMs = 0;
       break;
     default:
       break;
+  }
+
+  if (outputStateChanged) {
+    confirmationBeepUntilMs = millis() + OUTPUT_CONFIRM_BEEP_MS;
   }
 
   lastAcceptedTarget = target;
@@ -412,7 +425,11 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     memcpy(&lcmd, data, sizeof(lcmd));
     if (lcmd.type == 2 && lcmd.magic == DOOM_MAGIC) {
       portENTER_CRITICAL_ISR(&rxMux);
-      laserEnabled   = (lcmd.laserOn != 0);
+      bool newLaserState = (lcmd.laserOn != 0);
+      if (laserEnabled != newLaserState) {
+        confirmationBeepUntilMs = millis() + OUTPUT_CONFIRM_BEEP_MS;
+      }
+      laserEnabled   = newLaserState;
       lastLaserCmdMs = millis();
       rxLegacyCount++;
       portEXIT_CRITICAL_ISR(&rxMux);
